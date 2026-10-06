@@ -1,4 +1,4 @@
-name: Deploy prebuilt production release
+name: Deploy Asset Frontend Production
 
 on:
   push:
@@ -9,124 +9,363 @@ permissions:
   contents: read
 
 concurrency:
-  group: production-deploy
+  group: production-asset-frontend
   cancel-in-progress: false
 
 jobs:
   deploy:
-     runs-on: [self-hosted, Linux, X64, production, asset-frontend]
+    runs-on: [self-hosted, Linux, X64, production, asset-frontend]
+
     env:
-      # Replace this with the Linux production server IPv4 address.
-      SERVER_HOST: 20.193.139.63
-      DEPLOY_ROOT: /var/www/asset-frontend
+      DEPLOY_ROOT: /opt/asset-production/asset-frontend
       PM2_APP_NAME: asset-frontend
       HEALTH_URL: http://127.0.0.1:3005/
-      APP_KIND: frontend
-      REQUIRE_KEYS: false
-      SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
-      SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
-      SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
+      NODE_OPTIONS: --max-old-space-size=2048
 
     steps:
-      - name: Check deployment settings
+      # ============================================================
+      # 1. CHECK DISK SPACE
+      # ============================================================
+      - name: Check disk space
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$SERVER_HOST" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo 'Set SERVER_HOST in this workflow to the Linux server IPv4 address.'; exit 1; }
-          [[ -n "$SSH_USER" && -n "$SSH_PRIVATE_KEY" && -n "$SSH_KNOWN_HOSTS" ]] || { echo 'Configure DEPLOY_SSH_USER, DEPLOY_SSH_PRIVATE_KEY, and DEPLOY_SSH_KNOWN_HOSTS repository secrets.'; exit 1; }
 
-      - name: Check out prebuilt output only
+          echo "======================================"
+          echo "Checking disk space"
+          echo "======================================"
+
+          AVAIL_KB=$(df --output=avail / | tail -1)
+
+          echo "Free space: $((AVAIL_KB / 1024)) MB"
+
+          if [ "$AVAIL_KB" -le 3145728 ]; then
+            echo "❌ Less than 3GB free on /"
+            exit 1
+          fi
+
+          echo "✅ Disk space is sufficient"
+
+      # ============================================================
+      # 2. CHECKOUT
+      # ============================================================
+      - name: Checkout production package
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
           sparse-checkout-cone-mode: false
           sparse-checkout: |
-            /exported/**
-            !/exported/node_modules/**
-            !/exported/.env
-            !/exported/keys/**
-            !/exported/uploads/**
-            !/exported/.next/cache/**
+            exported/**
+            !exported/node_modules/**
+            !exported/.env
+            !exported/uploads/**
+            !exported/.next/cache/**
 
-      - name: Prepare SSH
+      # ============================================================
+      # 3. CHECK NODE / NPM
+      # ============================================================
+      - name: Check Node and npm version
         shell: bash
         run: |
           set -euo pipefail
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "$SSH_PRIVATE_KEY" > $HOME/.ssh/production_key
-          chmod 600 $HOME/.ssh/production_key
-          printf '%s\n' "$SSH_KNOWN_HOSTS" > $HOME/.ssh/known_hosts
-          chmod 600 $HOME/.ssh/known_hosts
 
-      - name: Upload release
+          echo "Node:"
+          node -v
+
+          echo "npm:"
+          npm -v
+
+          echo "Runner:"
+          hostname
+
+          echo "User:"
+          whoami
+
+      # ============================================================
+      # 4. VERIFY PRODUCTION PACKAGE
+      # ============================================================
+      - name: Verify production package
         shell: bash
         run: |
           set -euo pipefail
+
+          test -d exported
+          test -f exported/package.json
+          test -f exported/package-lock.json
+          test -d exported/.next
+
+          echo "✅ Production frontend package verified"
+
+      # ============================================================
+      # 5. PREPARE RELEASE
+      # ============================================================
+      - name: Prepare release
+        shell: bash
+        run: |
+          set -euo pipefail
+
           RELEASE_ID="${GITHUB_SHA}-${GITHUB_RUN_NUMBER}"
-          SSH=(ssh -i $HOME/.ssh/production_key -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts)
-          "${SSH[@]}" "$SSH_USER@$SERVER_HOST" "mkdir -p '$DEPLOY_ROOT/releases/$RELEASE_ID'"
-          rsync -az --delete \
-            --exclude='.env' --exclude='node_modules/' --exclude='uploads/' --exclude='keys/' --exclude='.next/cache/' \
-            -e "ssh -i $HOME/.ssh/production_key -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts" \
-            exported/ "$SSH_USER@$SERVER_HOST:$DEPLOY_ROOT/releases/$RELEASE_ID/"
-          printf '%s\n' "$RELEASE_ID" > "$RUNNER_TEMP/release-id"
+          RELEASE_DIR="$DEPLOY_ROOT/releases/$RELEASE_ID"
 
-      - name: Activate and verify, or roll back
+          echo "Release ID: $RELEASE_ID"
+          echo "Release directory: $RELEASE_DIR"
+
+          mkdir -p "$DEPLOY_ROOT/releases"
+          mkdir -p "$DEPLOY_ROOT/shared"
+
+          mkdir -p "$RELEASE_DIR"
+
+          echo "$RELEASE_ID" > "$RUNNER_TEMP/release-id"
+
+      # ============================================================
+      # 6. COPY RELEASE
+      # ============================================================
+      - name: Copy production package
         shell: bash
         run: |
           set -euo pipefail
+
           RELEASE_ID="$(cat "$RUNNER_TEMP/release-id")"
-          REMOTE_ARGS="$(python3 -c 'import shlex,sys; print(" ".join(shlex.quote(v) for v in sys.argv[1:]))' \
-            "$DEPLOY_ROOT" "$RELEASE_ID" "$PM2_APP_NAME" "$HEALTH_URL" "$APP_KIND" "$REQUIRE_KEYS")"
-          ssh -i $HOME/.ssh/production_key -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts \
-            "$SSH_USER@$SERVER_HOST" "bash -s -- $REMOTE_ARGS" <<'REMOTE_SCRIPT'
-          set -Eeuo pipefail
-          root="$1"; release_id="$2"; app_name="$3"; health_url="$4"; app_kind="$5"; require_keys="$6"
-          [[ "$root" == /* && "$root" != / && "$root" != *'..'* ]] || { echo 'DEPLOY_ROOT must be a safe absolute path.'; exit 1; }
-          [[ "$app_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo 'Invalid PM2 app name.'; exit 1; }
-          release="$root/releases/$release_id"
-          shared="$root/shared"
-          previous="$(readlink -f "$root/current" 2>/dev/null || true)"
-          [[ -d "$release" ]] || { echo 'Uploaded release directory is missing.'; exit 1; }
-          [[ -f "$shared/.env" ]] || { echo "Create the server-managed environment file at $shared/.env before deploying."; exit 1; }
-          mkdir -p "$shared/uploads" "$shared/keys"
-          ln -sfn "$shared/.env" "$release/.env"
-          ln -sfn "$shared/uploads" "$release/uploads"
-          if [[ "$require_keys" == true ]]; then
-            [[ -f "$shared/keys/private.pem" && -f "$shared/keys/public.pem" ]] || { echo "Put the Asset backend key pair in $shared/keys before deploying."; exit 1; }
-            ln -sfn "$shared/keys" "$release/keys"
-          fi
-          cd "$release"
-          npm ci --omit=dev --no-audit --no-fund
-          ln -sfn "$release" "$root/current.next"
-          mv -Tf "$root/current.next" "$root/current"
-          rollback() {
-            echo 'Restoring the previous release.'
-            if [[ -n "$previous" && -d "$previous" ]]; then
-              ln -sfn "$previous" "$root/current.rollback"
-              mv -Tf "$root/current.rollback" "$root/current"
-              pm2 delete "$app_name" >/dev/null 2>&1 || true
-              pm2 start npm --name "$app_name" --cwd "$root/current" -- start || true
-            else
-              rm -f "$root/current"
-              pm2 delete "$app_name" >/dev/null 2>&1 || true
-            fi
-          }
-          pm2 delete "$app_name" >/dev/null 2>&1 || true
-          pm2 start npm --name "$app_name" --cwd "$root/current" -- start || { rollback; exit 1; }
-          healthy=false
-          for attempt in $(seq 1 20); do
-            if curl --fail --silent --show-error --max-time 5 "$health_url" >/dev/null 2>&1; then healthy=true; break; fi
-            sleep 3
-          done
-          if [[ "$healthy" != true ]]; then
-            echo 'New release health check failed.'
-            rollback
+          RELEASE_DIR="$DEPLOY_ROOT/releases/$RELEASE_ID"
+
+          echo "Copying exported package..."
+
+          rsync -a --delete \
+            --exclude='.env' \
+            --exclude='node_modules/' \
+            --exclude='uploads/' \
+            --exclude='.next/cache/' \
+            exported/ "$RELEASE_DIR/"
+
+          echo "✅ Release copied"
+
+      # ============================================================
+      # 7. VERIFY PRODUCTION ENVIRONMENT
+      # ============================================================
+      - name: Verify production environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "$DEPLOY_ROOT/shared/.env" ]; then
+            echo "❌ Production environment file is missing:"
+            echo "$DEPLOY_ROOT/shared/.env"
+            echo ""
+            echo "Create it on the production VM before deployment."
             exit 1
           fi
+
+          echo "✅ Production .env exists"
+
+      # ============================================================
+      # 8. LINK ENVIRONMENT
+      # ============================================================
+      - name: Configure release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_ID="$(cat "$RUNNER_TEMP/release-id")"
+          RELEASE_DIR="$DEPLOY_ROOT/releases/$RELEASE_ID"
+
+          ln -sfn \
+            "$DEPLOY_ROOT/shared/.env" \
+            "$RELEASE_DIR/.env"
+
+          echo "✅ Production environment configured"
+
+      # ============================================================
+      # 9. INSTALL PRODUCTION DEPENDENCIES
+      # ============================================================
+      - name: Install production dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_ID="$(cat "$RUNNER_TEMP/release-id")"
+          RELEASE_DIR="$DEPLOY_ROOT/releases/$RELEASE_ID"
+
+          cd "$RELEASE_DIR"
+
+          npm ci \
+            --omit=dev \
+            --no-audit \
+            --no-fund \
+            --fetch-retries=5 \
+            --fetch-retry-mintimeout=20000 \
+            --fetch-retry-maxtimeout=120000
+
+          echo "✅ Production dependencies installed"
+
+      # ============================================================
+      # 10. ACTIVATE RELEASE
+      # ============================================================
+      - name: Activate release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_ID="$(cat "$RUNNER_TEMP/release-id")"
+          RELEASE_DIR="$DEPLOY_ROOT/releases/$RELEASE_ID"
+
+          PREVIOUS="$(readlink -f "$DEPLOY_ROOT/current" 2>/dev/null || true)"
+
+          echo "$PREVIOUS" > "$RUNNER_TEMP/previous-release"
+
+          ln -sfn "$RELEASE_DIR" "$DEPLOY_ROOT/current.next"
+          mv -Tf "$DEPLOY_ROOT/current.next" "$DEPLOY_ROOT/current"
+
+          echo "Current release:"
+          readlink -f "$DEPLOY_ROOT/current"
+
+      # ============================================================
+      # 11. RESTART PM2
+      # ============================================================
+      - name: Restart Asset Frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$DEPLOY_ROOT/current"
+
+          if pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
+            pm2 restart "$PM2_APP_NAME" --update-env
+          else
+            pm2 start npm \
+              --name "$PM2_APP_NAME" \
+              --cwd "$DEPLOY_ROOT/current" \
+              -- start
+          fi
+
           pm2 save
-          find "$root/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -nr | tail -n +6 | cut -d' ' -f2- | while IFS= read -r old; do
-            if [[ -n "$old" && "$old" != "$release" && "$old" != "$previous" ]]; then rm -rf -- "$old"; fi
+
+          echo "======================================"
+          echo "PM2 STATUS"
+          echo "======================================"
+
+          pm2 status
+
+      # ============================================================
+      # 12. HEALTH CHECK
+      # ============================================================
+      - name: Health check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MAX_ATTEMPTS=20
+          SLEEP_SECONDS=3
+
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+
+            echo "Health check attempt $i/$MAX_ATTEMPTS"
+
+            HTTP_CODE=$(curl -s \
+              -o /tmp/asset-frontend-health.txt \
+              -w "%{http_code}" \
+              --connect-timeout 5 \
+              --max-time 10 \
+              "$HEALTH_URL" || true)
+
+            echo "HTTP Status: $HTTP_CODE"
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ Asset Frontend is healthy"
+              exit 0
+            fi
+
+            sleep "$SLEEP_SECONDS"
           done
-          echo "Release $release_id deployed and healthy."
-          REMOTE_SCRIPT
+
+          echo "❌ Asset Frontend health check failed"
+          exit 1
+
+      # ============================================================
+      # 13. ROLLBACK ON FAILURE
+      # ============================================================
+      - name: Rollback on failure
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+
+          PREVIOUS="$(cat "$RUNNER_TEMP/previous-release" 2>/dev/null || true)"
+
+          echo "======================================"
+          echo "Deployment failed"
+          echo "Attempting rollback"
+          echo "======================================"
+
+          if [ -n "$PREVIOUS" ] && [ -d "$PREVIOUS" ]; then
+
+            ln -sfn "$PREVIOUS" "$DEPLOY_ROOT/current.rollback"
+            mv -Tf "$DEPLOY_ROOT/current.rollback" "$DEPLOY_ROOT/current"
+
+            pm2 delete "$PM2_APP_NAME" >/dev/null 2>&1 || true
+
+            pm2 start npm \
+              --name "$PM2_APP_NAME" \
+              --cwd "$DEPLOY_ROOT/current" \
+              -- start
+
+            pm2 save
+
+            echo "✅ Previous release restored"
+
+          else
+            echo "No previous release available for rollback"
+          fi
+
+          echo ""
+          echo "========== PM2 STATUS =========="
+          pm2 status || true
+
+          echo ""
+          echo "========== PM2 LOGS =========="
+          pm2 logs "$PM2_APP_NAME" --lines 100 --nostream || true
+
+      # ============================================================
+      # 14. CLEAN OLD RELEASES
+      # ============================================================
+      - name: Cleanup old releases
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CURRENT="$(readlink -f "$DEPLOY_ROOT/current" 2>/dev/null || true)"
+
+          find "$DEPLOY_ROOT/releases" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -printf '%T@ %p\n' |
+            sort -nr |
+            tail -n +6 |
+            cut -d' ' -f2- |
+            while IFS= read -r OLD_RELEASE; do
+
+              if [ -n "$OLD_RELEASE" ] && [ "$OLD_RELEASE" != "$CURRENT" ]; then
+                echo "Removing old release: $OLD_RELEASE"
+                rm -rf -- "$OLD_RELEASE"
+              fi
+
+            done
+
+          echo "✅ Old releases cleaned"
+
+      # ============================================================
+      # 15. FINAL STATUS
+      # ============================================================
+      - name: Deployment complete
+        if: success()
+        shell: bash
+        run: |
+          echo "======================================"
+          echo "✅ ASSET FRONTEND DEPLOYMENT SUCCESSFUL"
+          echo "======================================"
+
+          echo "Current release:"
+          readlink -f "$DEPLOY_ROOT/current"
+
+          pm2 status
